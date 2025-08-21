@@ -1,10 +1,17 @@
 # BTC TCP Client
 
-A pure TCP Bitcoin P2P client that connects to Bitcoin mainnet nodes and listens for transactions.
+A production-ready pure TCP Bitcoin P2P client that connects to Bitcoin mainnet nodes and listens for transactions. Designed for reliable relay operations to downstream systems.
 
 ## Usage:
 ```bash
+# Run directly
 go run main.go
+
+# For production: separate logs from JSON output
+go run main.go 2>btc-relay.log | your-downstream-processor
+
+# With systemd or process manager for automatic restarts
+./btc-client
 ```
 
 ## Features:
@@ -40,6 +47,13 @@ go run main.go
   - Unknown scripts: Hex representation for unrecognized patterns
 - Computes and prints confirmations when a seen tx is mined
 - Graceful shutdown with context management
+- **Reliability features**:
+  - Panic recovery in all goroutines
+  - Structured logging to stderr (separate from JSON data output)
+  - Message size validation to prevent OOM attacks
+  - Optimized connection timeouts for production use
+  - Graceful degradation when downstream systems are slow
+  - Periodic health monitoring and metrics reporting
 
 ## Building:
 ```bash
@@ -127,3 +141,53 @@ Reorg stats: count=1, last at height=999
 
 ## Network Configuration:
 The client connects to Bitcoin mainnet nodes and automatically retries connections if they fail. It includes a list of seed nodes and implements connection resilience with exponential backoff.
+
+## Production Deployment
+
+### Running with systemd
+
+Create `/etc/systemd/system/btc-relay.service`:
+```ini
+[Unit]
+Description=Bitcoin TCP Relay Client
+After=network.target
+
+[Service]
+Type=simple
+User=btcrelay
+ExecStart=/usr/local/bin/btc-client
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/btc-relay/output.json
+StandardError=append:/var/log/btc-relay/error.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Health Monitoring
+
+The client logs health metrics every 60 seconds to stderr:
+```
+[BTC-RELAY] 2024/01/01 12:00:00.123456 HEALTH: Queue 45/1000 (4.5%), Dropped: 0, TxCache: 1523 entries, Chain height: 812456
+```
+
+Monitor for:
+- **Queue utilization** > 80% indicates downstream is lagging
+- **Dropped messages** > 0 means data loss is occurring
+- **TxCache size** growing too large (resets on reconnect)
+
+### Production Best Practices
+
+1. **Separate logs from data**: Always redirect stderr to a log file
+2. **Use a process manager**: systemd, supervisor, or container orchestration
+3. **Monitor health logs**: Set up alerts for dropped messages or high queue usage
+4. **Pipe to a buffer**: Consider using a message queue between this client and your processor
+5. **Configure node address**: Set `BitcoinNode` variable or modify in code
+
+### Resource Requirements
+
+- **Memory**: ~100-500MB typical, depends on transaction volume
+- **CPU**: Minimal, mostly I/O bound
+- **Network**: Reliable connection to Bitcoin node required
+- **Disk**: Only for logs (JSON output should be piped)

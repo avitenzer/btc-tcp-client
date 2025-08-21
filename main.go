@@ -48,6 +48,17 @@ const (
 
 	InvTypeTx    = 1
 	InvTypeBlock = 2
+
+	// Message size limits for safety
+	MaxMessageSize   = 32 * 1024 * 1024 // 32MB max message size
+	MaxInvItems      = 50000            // Max items in INV message
+	MaxHeadersPerMsg = 2000             // Max headers per message
+
+	// Timeout configurations
+	DialTimeout      = 15 * time.Second // Connection establishment timeout
+	HandshakeTimeout = 10 * time.Second // Handshake completion timeout
+	MessageTimeout   = 30 * time.Second // Per-message read timeout (reduced from 120s)
+	PingInterval     = 30 * time.Second // Keep-alive ping interval
 )
 
 // Bitcoin node to connect to
@@ -58,7 +69,7 @@ func getNetworkMagic(nodeAddr string) uint32 {
 	// Extract port from address
 	parts := strings.Split(nodeAddr, ":")
 	if len(parts) != 2 {
-		log.Printf("Warning: Invalid node address format, defaulting to mainnet magic")
+		logger.Printf("Warning: Invalid node address format, defaulting to mainnet magic")
 		return MagicMainnet
 	}
 
@@ -73,7 +84,7 @@ func getNetworkMagic(nodeAddr string) uint32 {
 	case "18444":
 		return MagicRegtest
 	default:
-		log.Printf("Warning: Unknown port %s, defaulting to mainnet magic", port)
+		logger.Printf("Warning: Unknown port %s, defaulting to mainnet magic", port)
 		return MagicMainnet
 	}
 }
@@ -82,18 +93,26 @@ func getNetworkMagic(nodeAddr string) uint32 {
 func clearTransactionCache() {
 	oldSize := len(txSeen)
 	txSeen = make(map[string]*TxStatus)
-	log.Printf("Cleared transaction cache: %d entries removed", oldSize)
+	logger.Printf("Cleared transaction cache: %d entries removed", oldSize)
 }
 
 // jsonOutputProcessor handles non-blocking JSON output to downstream systems
 func jsonOutputProcessor(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("PANIC in JSON output processor: %v", r)
+			// Restart the processor after a panic
+			go jsonOutputProcessor(ctx)
+		}
+	}()
+
 	for {
 		select {
 		case jsonData := <-jsonOutputChan:
 			// Output to stdout (can be redirected to downstream systems)
 			fmt.Println(jsonData)
 		case <-ctx.Done():
-			log.Println("JSON output processor shutting down...")
+			logger.Println("JSON output processor shutting down...")
 			return
 		}
 	}
@@ -101,12 +120,64 @@ func jsonOutputProcessor(ctx context.Context) {
 
 // sendJSONOutput sends JSON data to the output processor without blocking
 func sendJSONOutput(jsonData string) {
+	// Update queue size metric
+	outputQueueSize = len(jsonOutputChan)
+
 	select {
 	case jsonOutputChan <- jsonData:
 		// Successfully queued
 	default:
-		// Channel is full, log warning but don't block
-		log.Printf("Warning: JSON output channel full, dropping message")
+		// Channel is full, implement graceful degradation
+		droppedMessages++
+		now := time.Now()
+
+		// Log warning with rate limiting (max once per second)
+		if now.Sub(lastDropTime) > time.Second {
+			logger.Printf("Warning: Downstream slow - dropped %d messages, queue full (%d/%d)",
+				droppedMessages, outputQueueSize, cap(jsonOutputChan))
+			lastDropTime = now
+		}
+
+		// If too many drops, log critical warning
+		if droppedMessages > 100 && droppedMessages%100 == 0 {
+			logger.Printf("CRITICAL: Downstream severely lagging - %d total messages dropped", droppedMessages)
+		}
+	}
+}
+
+// healthMonitor periodically reports system health metrics
+func healthMonitor(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("PANIC in health monitor: %v", r)
+			// Restart the monitor after a panic
+			go healthMonitor(ctx)
+		}
+	}()
+
+	ticker := time.NewTicker(60 * time.Second) // Report every minute
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Report health metrics
+			queueSize := len(jsonOutputChan)
+			queueCapacity := cap(jsonOutputChan)
+			queueUtilization := float64(queueSize) / float64(queueCapacity) * 100
+
+			logger.Printf("HEALTH: Queue %d/%d (%.1f%%), Dropped: %d, TxCache: %d entries, Chain height: %d",
+				queueSize, queueCapacity, queueUtilization, droppedMessages, len(txSeen), chain.tip.Height)
+
+			// Warn if queue is getting full
+			if queueUtilization > 80 {
+				logger.Printf("WARNING: Output queue at %.1f%% capacity - downstream may be lagging", queueUtilization)
+			}
+
+		case <-ctx.Done():
+			logger.Println("Health monitor shutting down...")
+			return
+		}
 	}
 }
 
@@ -212,7 +283,7 @@ func (c *Chain) handleReorg(oldTip, newTip *BlockNode) {
 	// Calculate reorg depth
 	reorgDepth := oldTip.Height - forkPoint.Height
 
-	log.Printf("REORG DETECTED: Chain tip changed from %s@%d to %s@%d (depth: %d blocks)",
+	logger.Printf("REORG DETECTED: Chain tip changed from %s@%d to %s@%d (depth: %d blocks)",
 		leHashToHex(oldTip.Hash), oldTip.Height,
 		leHashToHex(newTip.Hash), newTip.Height,
 		reorgDepth)
@@ -223,7 +294,7 @@ func (c *Chain) handleReorg(oldTip, newTip *BlockNode) {
 	c.lastReorgHeight = newTip.Height
 	c.reorgCount++
 
-	log.Printf("Reorg stats: count=%d, last at height=%d", c.reorgCount, c.lastReorgHeight)
+	logger.Printf("Reorg stats: count=%d, last at height=%d", c.reorgCount, c.lastReorgHeight)
 }
 
 func (c *Chain) findForkPoint(chain1, chain2 *BlockNode) *BlockNode {
@@ -269,7 +340,7 @@ func (c *Chain) updateTransactionStatuses(forkHeight int) {
 		if status.IncludedHeight > forkHeight {
 			// Transaction was in an orphaned block, reset it
 			status.IncludedHeight = 0
-			log.Printf("Transaction %s unconfirmed due to reorg (was at height %d)",
+			logger.Printf("Transaction %s unconfirmed due to reorg (was at height %d)",
 				txid, status.IncludedHeight)
 		}
 	}
@@ -335,6 +406,14 @@ var (
 
 	// Non-blocking JSON processing channel
 	jsonOutputChan = make(chan string, 1000) // Buffer 1000 messages
+
+	// Structured logger that writes to stderr
+	logger = log.New(os.Stderr, "[BTC-RELAY] ", log.LstdFlags|log.Lmicroseconds)
+
+	// Downstream health metrics
+	droppedMessages int64
+	lastDropTime    time.Time
+	outputQueueSize int
 )
 
 // ---------- tx parsing ----------
@@ -405,36 +484,39 @@ func main() {
 	// Start non-blocking JSON output processor
 	go jsonOutputProcessor(ctx)
 
+	// Start periodic health monitoring
+	go healthMonitor(ctx)
+
 	// Handle graceful shutdown on interrupt signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("Received shutdown signal, closing connections...")
+		logger.Println("Received shutdown signal, closing connections...")
 		cancel()
 	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down...")
+			logger.Println("Shutting down...")
 			return
 		default:
-			log.Printf("Attempting to connect to %s", BitcoinNode)
+			logger.Printf("Attempting to connect to %s", BitcoinNode)
 
 			if err := connectAndListen(ctx, BitcoinNode); err != nil {
 				if ctx.Err() != nil {
-					log.Println("Context cancelled, exiting...")
+					logger.Println("Context cancelled, exiting...")
 					return
 				}
-				log.Printf("Connection error: %v", err)
-				log.Printf("Retrying in 3 seconds...")
+				logger.Printf("Connection error: %v", err)
+				logger.Printf("Retrying in 3 seconds...")
 
 				// Wait with context cancellation check
 				select {
 				case <-time.After(3 * time.Second):
 				case <-ctx.Done():
-					log.Println("Shutting down...")
+					logger.Println("Shutting down...")
 					return
 				}
 				continue
@@ -452,11 +534,11 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 
 	// Determine network magic based on port
 	networkMagic := getNetworkMagic(nodeAddr)
-	log.Printf("Using network magic: 0x%08x for %s", networkMagic, nodeAddr)
+	logger.Printf("Using network magic: 0x%08x for %s", networkMagic, nodeAddr)
 
 	// Create dialer with context
 	dialer := &net.Dialer{
-		Timeout: 15 * time.Second,
+		Timeout: DialTimeout,
 	}
 
 	conn, err := dialer.DialContext(ctx, "tcp", nodeAddr)
@@ -464,12 +546,12 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	log.Printf("Connected to %s", nodeAddr)
+	logger.Printf("Connected to %s", nodeAddr)
 
 	if err := handshake(ctx, conn, networkMagic); err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
-	log.Println("Handshake complete")
+	logger.Println("Handshake complete")
 
 	// Send initial messages to appear as a normal Bitcoin node
 	if err := writeMessage(conn, "sendheaders", nil, networkMagic); err != nil {
@@ -478,29 +560,35 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 
 	// Send getaddr to request peer addresses (normal node behavior)
 	if err := writeMessage(conn, "getaddr", nil, networkMagic); err != nil {
-		log.Printf("getaddr failed: %v", err) // Don't fail on this
+		logger.Printf("getaddr failed: %v", err) // Don't fail on this
 	}
 
-	log.Println("Initial messages sent, listening for transactions...")
+	logger.Println("Initial messages sent, listening for transactions...")
 
-	// Start ping ticker for keep-alive with shorter interval
-	pingTicker := time.NewTicker(30 * time.Second)
+	// Start ping ticker for keep-alive
+	pingTicker := time.NewTicker(PingInterval)
 	defer pingTicker.Stop()
 
 	// Channel to handle ping ticker in select
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Printf("PANIC in ping ticker: %v", r)
+			}
+		}()
+
 		for {
 			select {
 			case <-pingTicker.C:
 				nonce := make([]byte, 8)
 				_, _ = rand.Read(nonce)
 				if err := writeMessage(conn, "ping", nonce, networkMagic); err != nil {
-					log.Printf("Failed to send ping: %v", err)
+					logger.Printf("Failed to send ping: %v", err)
 					return
 				}
-				log.Println("Sent keep-alive ping")
+				logger.Println("Sent keep-alive ping")
 			case <-ctx.Done():
-				log.Println("Ping ticker stopped due to context cancellation")
+				logger.Println("Ping ticker stopped due to context cancellation")
 				return
 			}
 		}
@@ -509,18 +597,18 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Context cancelled, stopping message processing")
+			logger.Println("Context cancelled, stopping message processing")
 			return ctx.Err()
 		default:
-			// Set read timeout for each message - longer to avoid false timeouts
-			if err := conn.SetReadDeadline(time.Now().Add(120 * time.Second)); err != nil {
+			// Set read timeout for each message
+			if err := conn.SetReadDeadline(time.Now().Add(MessageTimeout)); err != nil {
 				return fmt.Errorf("set read deadline: %w", err)
 			}
 
 			cmd, payload, err := readMessage(conn, networkMagic)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					log.Println("Read timeout, connection might be stale")
+					logger.Println("Read timeout, connection might be stale")
 					return fmt.Errorf("read timeout: %w", err)
 				}
 				return fmt.Errorf("read message: %w", err)
@@ -531,30 +619,30 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 				return fmt.Errorf("clear read deadline: %w", err)
 			}
 
-			log.Printf("Received message: %s (payload: %d bytes)", cmd, len(payload))
+			logger.Printf("Received message: %s (payload: %d bytes)", cmd, len(payload))
 
 			switch cmd {
 			case "inv":
 				reqTx, reqBlk := parseInv(payload)
 				// Request all announced transactions (no rate limiting)
 				if len(reqTx) > 0 {
-					log.Printf("INV: Requesting all %d announced transactions", len(reqTx))
+					logger.Printf("INV: Requesting all %d announced transactions", len(reqTx))
 
 					// Log the transaction hashes we're requesting
 					for i, hash := range reqTx {
-						log.Printf("Requesting TX #%d: %x", i, hash)
+						logger.Printf("Requesting TX #%d: %x", i, hash)
 					}
 
 					if err := sendGetData(conn, InvTypeTx, reqTx, networkMagic); err != nil {
-						log.Printf("getdata(tx) err: %v", err)
+						logger.Printf("getdata(tx) err: %v", err)
 					} else {
-						log.Printf("Successfully sent getdata request for %d transactions", len(reqTx))
+						logger.Printf("Successfully sent getdata request for %d transactions", len(reqTx))
 					}
 				}
 				if len(reqBlk) > 0 {
 					// Request all blocks (usually fewer)
 					if err := sendGetData(conn, InvTypeBlock, reqBlk, networkMagic); err != nil {
-						log.Printf("getdata(block) err: %v", err)
+						logger.Printf("getdata(block) err: %v", err)
 					}
 				}
 			case "headers":
@@ -565,20 +653,20 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 				parseAndPrintTx(payload)
 			case "ping":
 				if err := writeMessage(conn, "pong", payload, networkMagic); err != nil {
-					log.Printf("Failed to send pong: %v", err)
+					logger.Printf("Failed to send pong: %v", err)
 					return fmt.Errorf("pong: %w", err)
 				}
-				log.Println("Responded to ping with pong")
+				logger.Println("Responded to ping with pong")
 			case "pong":
-				log.Println("Received pong response")
+				logger.Println("Received pong response")
 			case "addr", "addrv2":
-				log.Printf("Received %s message with %d peers", cmd, len(payload))
+				logger.Printf("Received %s message with %d peers", cmd, len(payload))
 			case "sendheaders", "sendcmpct", "feefilter":
-				log.Printf("Received %s message", cmd)
+				logger.Printf("Received %s message", cmd)
 			case "reject":
-				log.Printf("Received reject message - peer rejected our request")
+				logger.Printf("Received reject message - peer rejected our request")
 			default:
-				log.Printf("Received unhandled message: %s", cmd)
+				logger.Printf("Received unhandled message: %s", cmd)
 			}
 		}
 	}
@@ -593,7 +681,7 @@ func handshake(ctx context.Context, conn net.Conn, magic uint32) error {
 	gotVer, gotAck := false, false
 
 	// Set a timeout for the handshake
-	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	handshakeCtx, cancel := context.WithTimeout(ctx, HandshakeTimeout)
 	defer cancel()
 
 	for !(gotVer && gotAck) {
@@ -697,6 +785,12 @@ func readMessage(conn net.Conn, magic uint32) (string, []byte, error) {
 	}
 	cmd := strings.TrimRight(string(h[4:16]), "\x00")
 	length := binary.LittleEndian.Uint32(h[16:20])
+
+	// Validate message size to prevent OOM attacks
+	if length > MaxMessageSize {
+		return "", nil, fmt.Errorf("message too large: %s size %d exceeds limit %d", cmd, length, MaxMessageSize)
+	}
+
 	var ck [4]byte
 	copy(ck[:], h[20:24])
 	var payload []byte
@@ -787,18 +881,25 @@ func parseInv(payload []byte) (txHashes [][]byte, blkHashes [][]byte) {
 	r := bytes.NewReader(payload)
 	n, err := readVarInt(r)
 	if err != nil {
-		log.Printf("inv varint: %v", err)
+		logger.Printf("inv varint: %v", err)
 		return
 	}
+
+	// Validate INV size to prevent excessive memory allocation
+	if n > MaxInvItems {
+		logger.Printf("inv too large: %d items exceeds limit %d", n, MaxInvItems)
+		return
+	}
+
 	for i := uint64(0); i < n; i++ {
 		var typ uint32
 		if err := binary.Read(r, binary.LittleEndian, &typ); err != nil {
-			log.Printf("inv type: %v", err)
+			logger.Printf("inv type: %v", err)
 			return
 		}
 		h := make([]byte, 32)
 		if _, err := io.ReadFull(r, h); err != nil {
-			log.Printf("inv hash: %v", err)
+			logger.Printf("inv hash: %v", err)
 			return
 		}
 		switch typ {
@@ -809,10 +910,10 @@ func parseInv(payload []byte) (txHashes [][]byte, blkHashes [][]byte) {
 		}
 	}
 	if len(txHashes) > 0 {
-		log.Printf("INV: %d tx(s) announced", len(txHashes))
+		logger.Printf("INV: %d tx(s) announced", len(txHashes))
 	}
 	if len(blkHashes) > 0 {
-		log.Printf("INV: %d block(s) announced", len(blkHashes))
+		logger.Printf("INV: %d block(s) announced", len(blkHashes))
 	}
 	return
 }
@@ -832,22 +933,22 @@ func parseHeaders(payload []byte) {
 	r := bytes.NewReader(payload)
 	n, err := readVarInt(r)
 	if err != nil {
-		log.Printf("headers varint: %v", err)
+		logger.Printf("headers varint: %v", err)
 		return
 	}
 	for i := uint64(0); i < n; i++ {
 		hdr := make([]byte, 80)
 		if _, err := io.ReadFull(r, hdr); err != nil {
-			log.Printf("header read: %v", err)
+			logger.Printf("header read: %v", err)
 			return
 		}
 		// txn_count (must be 0 in headers msg)
 		if _, err := readVarInt(r); err != nil {
-			log.Printf("headers txn_count: %v", err)
+			logger.Printf("headers txn_count: %v", err)
 			return
 		}
 		node := chain.addBlockHeaderFrom80(hdr)
-		log.Printf("HEADER: %s height=%d tip=%s@%d",
+		logger.Printf("HEADER: %s height=%d tip=%s@%d",
 			leHashToHex(node.Hash), node.Height,
 			func() string {
 				if chain.tip != nil {
@@ -869,16 +970,16 @@ func parseBlock(payload []byte) {
 	r := bytes.NewReader(payload)
 	hdr := make([]byte, 80)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		log.Printf("block header: %v", err)
+		logger.Printf("block header: %v", err)
 		return
 	}
 	node := chain.addBlockHeaderFrom80(hdr)
 	txCount, err := readVarInt(r)
 	if err != nil {
-		log.Printf("block txcount: %v", err)
+		logger.Printf("block txcount: %v", err)
 		return
 	}
-	log.Printf("BLOCK: %s height=%d txs=%d (tip=%s@%d)",
+	logger.Printf("BLOCK: %s height=%d txs=%d (tip=%s@%d)",
 		leHashToHex(node.Hash), node.Height, txCount,
 		func() string {
 			if chain.tip != nil {
@@ -897,7 +998,7 @@ func parseBlock(payload []byte) {
 	for i := uint64(0); i < txCount; i++ {
 		tx, rawNoWit, rawWithWit, err := readTx(r)
 		if err != nil {
-			log.Printf("block tx parse #%d: %v", i, err)
+			logger.Printf("block tx parse #%d: %v", i, err)
 			return
 		}
 		txid := hashToHex(doubleSHA256(rawNoWit))
@@ -910,7 +1011,7 @@ func parseBlock(payload []byte) {
 
 		jsonData, err := json.MarshalIndent(txJSON, "", "  ")
 		if err != nil {
-			log.Printf("JSON marshal error: %v", err)
+			logger.Printf("JSON marshal error: %v", err)
 			continue
 		}
 		// Non-blocking output to downstream systems
@@ -1017,7 +1118,7 @@ func parseAndPrintTx(payload []byte) {
 	r := bytes.NewReader(payload)
 	tx, rawNoWit, rawWithWit, err := readTx(r)
 	if err != nil {
-		log.Printf("tx parse: %v", err)
+		logger.Printf("tx parse: %v", err)
 		return
 	}
 
@@ -1033,7 +1134,7 @@ func parseAndPrintTx(payload []byte) {
 	txJSON := txToJSON(tx, txid, wtxid, len(payload))
 	jsonData, err := json.MarshalIndent(txJSON, "", "  ")
 	if err != nil {
-		log.Printf("JSON marshal error: %v", err)
+		logger.Printf("JSON marshal error: %v", err)
 		return
 	}
 
@@ -1042,8 +1143,6 @@ func parseAndPrintTx(payload []byte) {
 }
 
 func readTx(r *bytes.Reader) (*Tx, []byte, []byte, error) {
-	startPos := r.Size() - int64(r.Len())
-
 	var version uint32
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return nil, nil, nil, err
@@ -1123,10 +1222,8 @@ func readTx(r *bytes.Reader) (*Tx, []byte, []byte, error) {
 		return nil, nil, nil, err
 	}
 
-	endPos := r.Size() - int64(r.Len())
-	rawWithWit := make([]byte, endPos-startPos)
 	// We can't easily slice from bytes.Reader; rebuild the raw with witness:
-	rawWithWit = rebuildRawWithWitness(&Tx{
+	rawWithWit := rebuildRawWithWitness(&Tx{
 		Version: version, Vins: append([]TxIn(nil), vins...),
 		Vouts: vouts, LockTime: locktime, SegWit: segwit,
 	})
