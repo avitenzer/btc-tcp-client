@@ -26,6 +26,11 @@ go run main.go
   - Transaction cache cleared on each reconnection
   - Prevents unbounded memory growth across reconnects
   - Logs cache cleanup statistics
+- **Non-blocking JSON processing**:
+  - Asynchronous JSON output to downstream systems
+  - Prevents slow JSON processing from blocking Bitcoin network reads
+  - Buffered output channel with overflow protection
+  - Optimized for high-throughput relay operations
 - Parses transactions (legacy + segwit), prints inputs & outputs (addresses + amounts)
 - **Enhanced script parsing** supporting:
   - Standard outputs: P2PKH, P2SH, P2WPKH, P2WSH, P2TR (Taproot)

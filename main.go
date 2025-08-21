@@ -85,6 +85,31 @@ func clearTransactionCache() {
 	log.Printf("Cleared transaction cache: %d entries removed", oldSize)
 }
 
+// jsonOutputProcessor handles non-blocking JSON output to downstream systems
+func jsonOutputProcessor(ctx context.Context) {
+	for {
+		select {
+		case jsonData := <-jsonOutputChan:
+			// Output to stdout (can be redirected to downstream systems)
+			fmt.Println(jsonData)
+		case <-ctx.Done():
+			log.Println("JSON output processor shutting down...")
+			return
+		}
+	}
+}
+
+// sendJSONOutput sends JSON data to the output processor without blocking
+func sendJSONOutput(jsonData string) {
+	select {
+	case jsonOutputChan <- jsonData:
+		// Successfully queued
+	default:
+		// Channel is full, log warning but don't block
+		log.Printf("Warning: JSON output channel full, dropping message")
+	}
+}
+
 // ---------- wire header ----------
 type msgHeader struct {
 	Magic    uint32
@@ -307,6 +332,9 @@ type TxStatus struct {
 var (
 	chain  = NewChain()
 	txSeen = make(map[string]*TxStatus) // txid (hex) -> status
+
+	// Non-blocking JSON processing channel
+	jsonOutputChan = make(chan string, 1000) // Buffer 1000 messages
 )
 
 // ---------- tx parsing ----------
@@ -373,6 +401,9 @@ func main() {
 	// Create context with cancellation for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start non-blocking JSON output processor
+	go jsonOutputProcessor(ctx)
 
 	// Handle graceful shutdown on interrupt signals
 	sigChan := make(chan os.Signal, 1)
@@ -882,7 +913,8 @@ func parseBlock(payload []byte) {
 			log.Printf("JSON marshal error: %v", err)
 			continue
 		}
-		fmt.Printf("Block TX #%d:\n%s\n", i, string(jsonData))
+		// Non-blocking output to downstream systems
+		sendJSONOutput(fmt.Sprintf("Block TX #%d:\n%s", i, string(jsonData)))
 
 		// mark confirmations
 		st, ok := txSeen[txid]
@@ -997,7 +1029,7 @@ func parseAndPrintTx(payload []byte) {
 		txSeen[txid] = &TxStatus{FirstSeen: time.Now()}
 	}
 
-	// Convert to JSON and print
+	// Convert to JSON and send to output processor (non-blocking)
 	txJSON := txToJSON(tx, txid, wtxid, len(payload))
 	jsonData, err := json.MarshalIndent(txJSON, "", "  ")
 	if err != nil {
@@ -1005,7 +1037,8 @@ func parseAndPrintTx(payload []byte) {
 		return
 	}
 
-	fmt.Println(string(jsonData))
+	// Non-blocking output to downstream systems
+	sendJSONOutput(string(jsonData))
 }
 
 func readTx(r *bytes.Reader) (*Tx, []byte, []byte, error) {
