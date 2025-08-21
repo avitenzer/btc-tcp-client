@@ -39,14 +39,51 @@ regtest: 0xDAB5BFFA
 const (
 	UserAgent    = "/go-listener:0.3/"
 	ProtoVersion = int32(70016)
-	MagicRegtest = 0xD9B4BEF9
+
+	// Network magic values
+	MagicMainnet = 0xD9B4BEF9
+	MagicTestnet = 0x0709110B
+	MagicSignet  = 0x0A03CF40
+	MagicRegtest = 0xDAB5BFFA
 
 	InvTypeTx    = 1
 	InvTypeBlock = 2
 )
 
-// Bitcoin mainnet node to connect to
+// Bitcoin node to connect to
 var BitcoinNode = "71.254.210.237:8333"
+
+// getNetworkMagic returns the appropriate network magic value based on the port number
+func getNetworkMagic(nodeAddr string) uint32 {
+	// Extract port from address
+	parts := strings.Split(nodeAddr, ":")
+	if len(parts) != 2 {
+		log.Printf("Warning: Invalid node address format, defaulting to mainnet magic")
+		return MagicMainnet
+	}
+
+	port := parts[1]
+	switch port {
+	case "8333":
+		return MagicMainnet
+	case "18333":
+		return MagicTestnet
+	case "38333":
+		return MagicSignet
+	case "18444":
+		return MagicRegtest
+	default:
+		log.Printf("Warning: Unknown port %s, defaulting to mainnet magic", port)
+		return MagicMainnet
+	}
+}
+
+// clearTransactionCache clears the transaction cache to prevent memory leaks
+func clearTransactionCache() {
+	oldSize := len(txSeen)
+	txSeen = make(map[string]*TxStatus)
+	log.Printf("Cleared transaction cache: %d entries removed", oldSize)
+}
 
 // ---------- wire header ----------
 type msgHeader struct {
@@ -379,6 +416,13 @@ func main() {
 }
 
 func connectAndListen(ctx context.Context, nodeAddr string) error {
+	// Clear transaction cache on new connection to prevent memory leaks
+	clearTransactionCache()
+
+	// Determine network magic based on port
+	networkMagic := getNetworkMagic(nodeAddr)
+	log.Printf("Using network magic: 0x%08x for %s", networkMagic, nodeAddr)
+
 	// Create dialer with context
 	dialer := &net.Dialer{
 		Timeout: 15 * time.Second,
@@ -391,18 +435,18 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 	defer conn.Close()
 	log.Printf("Connected to %s", nodeAddr)
 
-	if err := handshake(ctx, conn); err != nil {
+	if err := handshake(ctx, conn, networkMagic); err != nil {
 		return fmt.Errorf("handshake: %w", err)
 	}
 	log.Println("Handshake complete")
 
 	// Send initial messages to appear as a normal Bitcoin node
-	if err := writeMessage(conn, "sendheaders", nil); err != nil {
+	if err := writeMessage(conn, "sendheaders", nil, networkMagic); err != nil {
 		return fmt.Errorf("sendheaders: %w", err)
 	}
 
 	// Send getaddr to request peer addresses (normal node behavior)
-	if err := writeMessage(conn, "getaddr", nil); err != nil {
+	if err := writeMessage(conn, "getaddr", nil, networkMagic); err != nil {
 		log.Printf("getaddr failed: %v", err) // Don't fail on this
 	}
 
@@ -419,7 +463,7 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 			case <-pingTicker.C:
 				nonce := make([]byte, 8)
 				_, _ = rand.Read(nonce)
-				if err := writeMessage(conn, "ping", nonce); err != nil {
+				if err := writeMessage(conn, "ping", nonce, networkMagic); err != nil {
 					log.Printf("Failed to send ping: %v", err)
 					return
 				}
@@ -442,7 +486,7 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 				return fmt.Errorf("set read deadline: %w", err)
 			}
 
-			cmd, payload, err := readMessage(conn)
+			cmd, payload, err := readMessage(conn, networkMagic)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Println("Read timeout, connection might be stale")
@@ -470,7 +514,7 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 						log.Printf("Requesting TX #%d: %x", i, hash)
 					}
 
-					if err := sendGetData(conn, InvTypeTx, reqTx); err != nil {
+					if err := sendGetData(conn, InvTypeTx, reqTx, networkMagic); err != nil {
 						log.Printf("getdata(tx) err: %v", err)
 					} else {
 						log.Printf("Successfully sent getdata request for %d transactions", len(reqTx))
@@ -478,7 +522,7 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 				}
 				if len(reqBlk) > 0 {
 					// Request all blocks (usually fewer)
-					if err := sendGetData(conn, InvTypeBlock, reqBlk); err != nil {
+					if err := sendGetData(conn, InvTypeBlock, reqBlk, networkMagic); err != nil {
 						log.Printf("getdata(block) err: %v", err)
 					}
 				}
@@ -489,7 +533,7 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 			case "tx":
 				parseAndPrintTx(payload)
 			case "ping":
-				if err := writeMessage(conn, "pong", payload); err != nil {
+				if err := writeMessage(conn, "pong", payload, networkMagic); err != nil {
 					log.Printf("Failed to send pong: %v", err)
 					return fmt.Errorf("pong: %w", err)
 				}
@@ -510,9 +554,9 @@ func connectAndListen(ctx context.Context, nodeAddr string) error {
 }
 
 // ---------- handshake ----------
-func handshake(ctx context.Context, conn net.Conn) error {
+func handshake(ctx context.Context, conn net.Conn, magic uint32) error {
 	vPayload := buildVersionPayload()
-	if err := writeMessage(conn, "version", vPayload); err != nil {
+	if err := writeMessage(conn, "version", vPayload, magic); err != nil {
 		return fmt.Errorf("send version: %w", err)
 	}
 	gotVer, gotAck := false, false
@@ -531,7 +575,7 @@ func handshake(ctx context.Context, conn net.Conn) error {
 				return fmt.Errorf("set read deadline: %w", err)
 			}
 
-			cmd, payload, err := readMessage(conn)
+			cmd, payload, err := readMessage(conn, magic)
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				// Check if context was cancelled during timeout
 				select {
@@ -548,13 +592,13 @@ func handshake(ctx context.Context, conn net.Conn) error {
 			switch cmd {
 			case "version":
 				gotVer = true
-				if err := writeMessage(conn, "verack", nil); err != nil {
+				if err := writeMessage(conn, "verack", nil, magic); err != nil {
 					return err
 				}
 			case "verack":
 				gotAck = true
 			case "ping":
-				_ = writeMessage(conn, "pong", payload)
+				_ = writeMessage(conn, "pong", payload, magic)
 			}
 		}
 	}
@@ -592,9 +636,9 @@ func writeNetAddr(b *bytes.Buffer, services uint64, ip string, port uint16) {
 }
 
 // ---------- wire framing ----------
-func writeMessage(conn net.Conn, cmd string, payload []byte) error {
+func writeMessage(conn net.Conn, cmd string, payload []byte, magic uint32) error {
 	var hdr msgHeader
-	hdr.Magic = MagicRegtest
+	hdr.Magic = magic
 	copy(hdr.Command[:], []byte(cmd))
 	hdr.Length = uint32(len(payload))
 	sum := checksum(payload)
@@ -611,14 +655,14 @@ func writeMessage(conn net.Conn, cmd string, payload []byte) error {
 	return err
 }
 
-func readMessage(conn net.Conn) (string, []byte, error) {
+func readMessage(conn net.Conn, magic uint32) (string, []byte, error) {
 	h := make([]byte, 24)
 	if _, err := io.ReadFull(conn, h); err != nil {
 		return "", nil, err
 	}
-	magic := binary.LittleEndian.Uint32(h[0:4])
-	if magic != MagicRegtest {
-		return "", nil, fmt.Errorf("magic mismatch: got 0x%08x", magic)
+	receivedMagic := binary.LittleEndian.Uint32(h[0:4])
+	if receivedMagic != magic {
+		return "", nil, fmt.Errorf("magic mismatch: got 0x%08x, expected 0x%08x", receivedMagic, magic)
 	}
 	cmd := strings.TrimRight(string(h[4:16]), "\x00")
 	length := binary.LittleEndian.Uint32(h[16:20])
@@ -742,14 +786,14 @@ func parseInv(payload []byte) (txHashes [][]byte, blkHashes [][]byte) {
 	return
 }
 
-func sendGetData(conn net.Conn, invType uint32, hashes [][]byte) error {
+func sendGetData(conn net.Conn, invType uint32, hashes [][]byte, magic uint32) error {
 	var b bytes.Buffer
 	writeVarInt(&b, uint64(len(hashes)))
 	for _, h := range hashes {
 		binary.Write(&b, binary.LittleEndian, invType)
 		b.Write(h) // LE byte order, as received
 	}
-	return writeMessage(conn, "getdata", b.Bytes())
+	return writeMessage(conn, "getdata", b.Bytes(), magic)
 }
 
 // ---------- headers/block ----------

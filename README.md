@@ -10,12 +10,22 @@ go run main.go
 ## Features:
 - Handshakes (version/verack), sends sendheaders + mempool
 - Receives inv (tx + block), getdata, tx, headers, block
+- **Dynamic network magic selection**:
+  - Automatically detects network based on port number
+  - 8333 → mainnet (0xD9B4BEF9)
+  - 18333 → testnet (0x0709110B)
+  - 38333 → signet (0x0A03CF40)
+  - 18444 → regtest (0xDAB5BFFA)
 - **Production-ready chain management**:
   - Chain work validation (not just longest chain)
   - Automatic reorg detection and handling
   - Transaction status updates during reorgs
   - Fork point detection and orphaned block handling
   - Reorg statistics and logging
+- **Memory management**:
+  - Transaction cache cleared on each reconnection
+  - Prevents unbounded memory growth across reconnects
+  - Logs cache cleanup statistics
 - Parses transactions (legacy + segwit), prints inputs & outputs (addresses + amounts)
 - **Enhanced script parsing** supporting:
   - Standard outputs: P2PKH, P2SH, P2WPKH, P2WSH, P2TR (Taproot)
