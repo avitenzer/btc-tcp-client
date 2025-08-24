@@ -142,6 +142,107 @@ Reorg stats: count=1, last at height=999
 ## Network Configuration:
 The client connects to Bitcoin mainnet nodes and automatically retries connections if they fail. It includes a list of seed nodes and implements connection resilience with exponential backoff.
 
+## Message Types and Protocol Flow
+
+### Supported Message Types
+
+The client implements the Bitcoin P2P protocol and supports the following message types:
+
+#### 1. Handshake Messages
+- **`version`**: Initial connection message containing protocol version, user agent, and network information
+- **`verack`**: Acknowledgment of version message to complete handshake
+- **`ping`/`pong`**: Keep-alive messages sent every 30 seconds to maintain connection
+
+#### 2. Data Announcement Messages
+- **`inv`** (Inventory): Announces available transactions and blocks
+  - Can contain up to 50,000 items
+  - Types: `InvTypeTx` (1) for transactions, `InvTypeBlock` (2) for blocks
+- **`getdata`**: Requests full data for items announced in `inv` messages
+
+#### 3. Data Transfer Messages
+- **`tx`**: Full transaction data (both legacy and SegWit transactions)
+- **`block`**: Complete block data including all transactions
+- **`headers`**: Block headers without transaction data (up to 2,000 per message)
+
+#### 4. Configuration Messages
+- **`sendheaders`**: Tells peer to send new blocks as headers instead of inv
+- **`getaddr`**: Requests list of known peer addresses
+- **`addr`/`addrv2`**: Provides peer addresses
+- **`sendcmpct`**, **`feefilter`**: Other configuration messages (acknowledged but not actively used)
+
+### Message Flow
+
+#### 1. Connection Establishment
+```
+Client → Node: TCP connection to port (8333 for mainnet)
+Client → Node: version message
+Node → Client: version message  
+Client → Node: verack
+Node → Client: verack
+[Handshake complete]
+```
+
+#### 2. Initial Setup
+```
+Client → Node: sendheaders (request headers instead of inv)
+Client → Node: getaddr (request peer list)
+```
+
+#### 3. Transaction Flow
+```
+Node → Client: inv (announces new transactions)
+Client → Node: getdata (requests full tx data)
+Node → Client: tx (sends transaction data)
+Client: Parses tx, outputs JSON, tracks in cache
+```
+
+#### 4. Block Flow
+```
+Node → Client: inv (announces new block)
+Client → Node: getdata (requests block)
+Node → Client: block (sends full block data)
+Client: 
+  - Updates chain index with proof-of-work validation
+  - Detects reorgs if necessary
+  - Updates transaction confirmations
+  - Outputs JSON for each transaction
+```
+
+#### 5. Keep-Alive Flow
+```
+Every 30 seconds:
+Client → Node: ping (with random nonce)
+Node → Client: pong (echoes nonce)
+```
+
+### Key Protocol Features
+
+1. **Non-blocking JSON Output**: Messages are parsed and converted to JSON, then sent through a buffered channel (1000 messages) to prevent blocking network reads
+
+2. **Chain Management**: 
+   - Maintains chain index with proof-of-work validation
+   - Detects and handles reorganizations
+   - Tracks cumulative chain work, not just height
+
+3. **Transaction Tracking**:
+   - Caches seen transactions
+   - Updates confirmation count when included in blocks
+   - Handles status changes during reorgs
+   - Cache cleared on reconnection to prevent memory leaks
+
+4. **Message Size Limits**:
+   - Max message size: 32MB
+   - Max inventory items: 50,000
+   - Max headers per message: 2,000
+
+5. **Network Auto-Detection**:
+   - Port 8333 → Mainnet (magic: 0xD9B4BEF9)
+   - Port 18333 → Testnet (magic: 0x0709110B)
+   - Port 38333 → Signet (magic: 0x0A03CF40)
+   - Port 18444 → Regtest (magic: 0xDAB5BFFA)
+
+The application operates as a passive listener, receiving transaction and block announcements from the Bitcoin network and outputting structured JSON data for downstream processing.
+
 ## Production Deployment
 
 ### Running with systemd
